@@ -1,6 +1,15 @@
 // App.jsx
-import { useState } from "react";
-import { Plus, Trash2, ChevronDown, ChevronRight, Upload } from "lucide-react";
+import { useRef, useState } from "react";
+import {
+  Plus,
+  Trash2,
+  ChevronDown,
+  ChevronRight,
+  Upload,
+  Loader2,
+} from "lucide-react";
+import { parseCurriculumFromPDF } from "./lib/parseCurriculum.js";
+
 
 const ACCENT = "#EC8601";
 let idCounter = 1;
@@ -31,6 +40,27 @@ const initialCurriculum = {
   description: "",
   modules: [],
 };
+
+// Converts raw AI JSON into the same builder shapes used by manual creation,
+// so every node gets a real id and both flows are indistinguishable downstream.
+function hydrateFromAI(aiData) {
+  return {
+    title: aiData.title || "Untitled Curriculum",
+    description: aiData.description || "",
+    modules: (aiData.modules || []).map((m) => ({
+      ...makeModule(m.title),
+      description: m.description || "",
+      topics: (m.topics || []).map((t) => ({
+        ...makeTopic(t.title),
+        description: t.description || "",
+        lessons: (t.lessons || []).map((l) => ({
+          ...makeLesson(l.title),
+          description: l.description || "",
+        })),
+      })),
+    })),
+  };
+}
 
 // ---------- Reusable inline-editable pieces ----------
 
@@ -95,7 +125,7 @@ function DeleteButton({ onClick }) {
   );
 }
 
-// Small numbered node that sits ON the vertical line
+// Small numbered node that sits ON the vertical trunk line
 function Node({ number, size = "md" }) {
   const sizes = {
     lg: "w-7 h-7 text-xs",
@@ -117,7 +147,6 @@ function Node({ number, size = "md" }) {
 function Lesson({ lesson, number, onUpdate, onDelete }) {
   return (
     <div className="group relative flex items-start gap-3 py-2">
-      {/* connecting line segment */}
       <div className="absolute left-[9px] top-0 bottom-0 w-px bg-gray-200" />
       <Node number={number} size="sm" />
       <div className="flex-1 min-w-0 -mt-0.5">
@@ -157,7 +186,6 @@ function Topic({ topic, number, onUpdate, onDelete, isLast }) {
 
   return (
     <div className="relative">
-      {/* line coming from parent module node down to this topic, stops mid if last */}
       <div
         className={`absolute left-[11px] top-0 w-px bg-gray-200 ${
           isLast ? "h-5" : "bottom-0"
@@ -188,7 +216,7 @@ function Topic({ topic, number, onUpdate, onDelete, isLast }) {
       </div>
 
       {open && (
-        <div className="ml-[27px] pl-3 border-l border-transparent">
+        <div className="ml-[27px] pl-3">
           <div className="pl-3">
             {topic.lessons.map((lesson, i) => (
               <Lesson
@@ -228,7 +256,6 @@ function Module({ module, number, onUpdate, onDelete, isLast }) {
 
   return (
     <div className="relative">
-      {/* main trunk line running through the whole module block */}
       <div
         className={`absolute left-[13px] top-0 w-px bg-gray-200 ${
           isLast ? "h-6" : "bottom-0"
@@ -283,6 +310,9 @@ function Module({ module, number, onUpdate, onDelete, isLast }) {
 
 export default function App() {
   const [curriculum, setCurriculum] = useState(initialCurriculum);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const fileInputRef = useRef(null);
 
   const updateModule = (updated) =>
     setCurriculum({
@@ -304,6 +334,30 @@ export default function App() {
       modules: [...curriculum.modules, makeModule()],
     });
 
+  const handleFileSelect = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (file.type !== "application/pdf") {
+      setUploadError("Please upload a PDF file.");
+      return;
+    }
+
+    setUploading(true);
+    setUploadError("");
+
+    try {
+      const aiData = await parseCurriculumFromPDF(file);
+      setCurriculum(hydrateFromAI(aiData));
+    } catch (err) {
+      console.error(err);
+      setUploadError("Something went wrong parsing the PDF. Please try again.");
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="max-w-3xl mx-auto px-6 py-10">
@@ -323,19 +377,43 @@ export default function App() {
               placeholder="Add a description..."
             />
           </div>
-          <button
-            className="flex items-center gap-2 text-white text-sm font-medium px-4 py-2 rounded-lg shadow-sm hover:opacity-90 transition-opacity shrink-0 ml-4"
-            style={{ backgroundColor: ACCENT }}
-          >
-            <Upload size={16} /> Upload Curriculum
-          </button>
+
+          <div className="shrink-0 ml-4 flex flex-col items-end gap-1">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf"
+              className="hidden"
+              onChange={handleFileSelect}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              className="flex items-center gap-2 text-white text-sm font-medium px-4 py-2 rounded-lg shadow-sm hover:opacity-90 transition-opacity disabled:opacity-60"
+              style={{ backgroundColor: ACCENT }}
+            >
+              {uploading ? (
+                <>
+                  <Loader2 size={16} className="animate-spin" /> Parsing PDF...
+                </>
+              ) : (
+                <>
+                  <Upload size={16} /> Upload Curriculum
+                </>
+              )}
+            </button>
+            {uploadError && (
+              <p className="text-xs text-red-500 max-w-[220px] text-right">
+                {uploadError}
+              </p>
+            )}
+          </div>
         </div>
 
-        {/* single unified container holding the whole tree */}
         <div className="bg-white rounded-2xl border border-gray-200 shadow-sm px-6 py-2">
           {curriculum.modules.length === 0 && (
             <p className="text-sm text-gray-400 italic py-6 text-center">
-              No modules yet. Add your first one below.
+              No modules yet. Add your first one below, or upload a PDF.
             </p>
           )}
           {curriculum.modules.map((module, i) => (
