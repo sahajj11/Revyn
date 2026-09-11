@@ -6,23 +6,31 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
 const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
 
+// Gemini's inline-data request size ceiling. Keep a safety margin under the
+// documented ~20MB limit for base64-encoded inline content.
+const MAX_INLINE_PDF_BYTES = 18 * 1024 * 1024;
+
 const SYSTEM_PROMPT = `You are a curriculum structuring engine for a nursing education platform.
-You convert raw, messy PDF text (syllabi, course outlines, training docs) into a strict JSON hierarchy:
+You convert raw, messy PDF content (syllabi, course outlines, training docs — which may include
+diagrams, charts, tables, or scanned pages alongside plain text) into a strict JSON hierarchy:
 Curriculum → Modules → Topics → Lessons.
 
 Rules:
 1. Identify natural Modules (major sections/units) from headings, numbering, or topic shifts.
 2. Under each Module, identify Topics (sub-sections).
 3. Under each Topic, identify Lessons (individual teaching units).
-4. If the document has Modules but is missing Topics or Lessons, INFER reasonable ones based on
+4. If content is presented visually (a diagram, chart, table, or annotated image rather than
+   plain paragraphs), interpret it the same way you would interpret text — extract the Modules,
+   Topics, and Lessons it implies rather than ignoring it.
+5. If the document has Modules but is missing Topics or Lessons, INFER reasonable ones based on
    the surrounding context and standard nursing-education structure. Never leave a Module with
    zero Topics, or a Topic with zero Lessons.
-5. If the document has NO recognisable structure at all (e.g. a plain paragraph, a resume, random
+6. If the document has NO recognisable structure at all (e.g. a plain paragraph, a resume, random
    text), do not fabricate a fake curriculum. Instead create ONE Module titled "Imported Content"
    containing ONE Topic titled "Review Needed" with a single Lesson whose description explains
    that the source document had no clear structure and should be reviewed manually.
-6. Write concise, plain-language titles (max ~8 words) and one-sentence descriptions.
-7. Output ONLY valid JSON. No markdown fences, no commentary, no preamble.
+7. Write concise, plain-language titles (max ~8 words) and one-sentence descriptions.
+8. Output ONLY valid JSON. No markdown fences, no commentary, no preamble.
 
 Output schema:
 {
@@ -61,24 +69,56 @@ function isRetryableError(error) {
   );
 }
 
-// Extracts plain text from a PDF entirely in the browser. Much faster for
-// the model to process than sending the raw PDF binary, since it skips
-// document-layout/vision parsing and just reads text straight away.
-// Returns "" if the PDF has little/no extractable text (e.g. scanned pages),
-// signalling the caller to fall back to sending the raw file instead.
-async function extractTextFromPDF(file) {
+// Safely creates an Error with an attached cause across all runtime and TS target versions
+function createNestedError(message, cause) {
+  try {
+    return new Error(message, { cause });
+  } catch {
+    const err = new Error(message);
+    err.cause = cause;
+    return err;
+  }
+}
+
+// Inspects a PDF for both extractable text AND embedded images, so the
+// caller can decide intelligently between the fast text-only path and the
+// slower-but-vision-capable raw-PDF path.
+async function analyzePDF(file) {
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
   let fullText = "";
+  let imageOpCount = 0;
+  let pagesWithImages = 0;
+
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
+
     const content = await page.getTextContent();
     const pageText = content.items.map((item) => item.str).join(" ");
     fullText += pageText + "\n\n";
+
+    const opList = await page.getOperatorList();
+    let pageHasImage = false;
+    for (const fn of opList.fnArray) {
+      if (
+        fn === pdfjsLib.OPS.paintImageXObject ||
+        fn === pdfjsLib.OPS.paintJpegXObject ||
+        fn === pdfjsLib.OPS.paintImageXObjectRepeat
+      ) {
+        imageOpCount++;
+        pageHasImage = true;
+      }
+    }
+    if (pageHasImage) pagesWithImages++;
   }
 
-  return fullText.trim();
+  return {
+    text: fullText.trim(),
+    numPages: pdf.numPages,
+    imageOpCount,
+    pagesWithImages,
+  };
 }
 
 async function fileToBase64(file) {
@@ -97,6 +137,77 @@ async function fileToBase64(file) {
   });
 }
 
+// --- JSON repair for truncated model output -------------------------------
+
+function computeOpenStack(str) {
+  let inString = false;
+  let escapeNext = false;
+  const stack = [];
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (inString) {
+      if (escapeNext) escapeNext = false;
+      else if (ch === "\\") escapeNext = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{" || ch === "[") stack.push(ch);
+    else if (ch === "}" || ch === "]") stack.pop();
+  }
+
+  return stack;
+}
+
+function findLastSafeCut(str) {
+  let inString = false;
+  let escapeNext = false;
+  let lastSafeIndex = -1;
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (inString) {
+      if (escapeNext) escapeNext = false;
+      else if (ch === "\\") escapeNext = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "," || ch === "}" || ch === "]") {
+      lastSafeIndex = i;
+    }
+  }
+
+  return lastSafeIndex;
+}
+
+function attemptJSONRepair(raw) {
+  const cutIndex = findLastSafeCut(raw);
+  if (cutIndex === -1) return null;
+
+  const truncated = raw.slice(0, cutIndex + 1).replace(/,\s*$/, "");
+  const openStack = computeOpenStack(truncated);
+
+  const closer = { "{": "}", "[": "]" };
+  let closing = "";
+  for (let i = openStack.length - 1; i >= 0; i--) {
+    closing += closer[openStack[i]];
+  }
+
+  try {
+    return JSON.parse(truncated + closing);
+  } catch {
+    return null;
+  }
+}
+
 async function generateWithRetry(content, maxRetries = 3) {
   const models = ["gemini-3.6-flash"];
 
@@ -108,11 +219,7 @@ async function generateWithRetry(content, maxRetries = 3) {
       systemInstruction: SYSTEM_PROMPT,
       generationConfig: {
         responseMimeType: "application/json",
-        maxOutputTokens: 8192,
-        // gemini-3.x can't fully disable thinking (thinkingBudget is a 2.5-only
-        // param), but thinkingLevel controls how much reasoning it does before
-        // answering. "low" is enough for structured extraction and noticeably
-        // faster than the "medium" default for a task this mechanical.
+        maxOutputTokens: 65536,
         thinkingConfig: {
           thinkingLevel: "low",
         },
@@ -125,7 +232,16 @@ async function generateWithRetry(content, maxRetries = 3) {
       try {
         console.log(`Trying ${modelName} — attempt ${attempt + 1}`);
         const result = await model.generateContent(content);
-        return result.response.text();
+        const text = result.response.text();
+        const finishReason = result.response.candidates?.[0]?.finishReason;
+
+        if (finishReason === "MAX_TOKENS") {
+          console.warn(
+            `${modelName} hit MAX_TOKENS — response was likely truncated before the JSON closed.`
+          );
+        }
+
+        return { text, finishReason };
       } catch (error) {
         lastError = error;
         console.error(`${modelName} failed:`, error?.message || error);
@@ -163,29 +279,56 @@ export async function parseCurriculumFromPDF(file) {
   let content;
 
   try {
-    const extractedText = await extractTextFromPDF(file);
+    const { text, numPages, imageOpCount, pagesWithImages } = await analyzePDF(file);
 
-    // Treat very short extractions as "not enough real text" (likely a
-    // scanned/image PDF) and fall back to sending the raw binary so Gemini
-    // can use its own document/vision parsing instead.
-    if (extractedText.length > 100) {
-      console.log(`Extracted ${extractedText.length} characters client-side — sending as text.`);
-      content = [
-        { text: `PDF content:\n\n${extractedText}` },
-        { text: "Convert this PDF content into the curriculum JSON schema." },
-      ];
-    } else {
-      console.warn("Little/no extractable text found — falling back to sending the raw PDF.");
+    const isMostlyImageBased = text.length < 100;
+    const hasSignificantImages = pagesWithImages / Math.max(numPages, 1) > 0.25 || imageOpCount > 5;
+
+    if (isMostlyImageBased || hasSignificantImages) {
+      const routeType = isMostlyImageBased
+        ? "vision (scanned/no text layer)"
+        : "vision (text + meaningful images)";
+      console.log(
+        `Routing to raw PDF (${routeType}) — ${numPages} pages, ${imageOpCount} image ops across ${pagesWithImages} page(s).`
+      );
+
+      if (file.size > MAX_INLINE_PDF_BYTES) {
+        throw new Error(
+          `This PDF is ${(file.size / (1024 * 1024)).toFixed(1)}MB, which is too large to send for image-based parsing. Try a smaller file, or a version with fewer embedded images.`
+        );
+      }
+
       const base64Data = await fileToBase64(file);
       content = [
         { inlineData: { mimeType: "application/pdf", data: base64Data } },
-        { text: "Convert this PDF into the curriculum JSON schema." },
+        {
+          text:
+            "Convert this PDF into the curriculum JSON schema. This document includes diagrams, " +
+            "charts, or other visual content in addition to text — interpret those visually as well, " +
+            "not just the plain text.",
+        },
+      ];
+    } else {
+      console.log(`Routing to text-only (${text.length} characters extracted, ${numPages} pages, no significant images).`);
+      content = [
+        { text: `PDF content:\n\n${text}` },
+        { text: "Convert this PDF content into the curriculum JSON schema." },
       ];
     }
   } catch (err) {
-    // If client-side extraction itself throws (corrupt file, unusual PDF
-    // structure), fall back to raw binary rather than failing the upload.
-    console.warn("Client-side text extraction failed, falling back to raw PDF:", err);
+    if (err.message?.includes("too large")) {
+      throw err;
+    }
+
+    console.warn("Client-side PDF analysis failed, falling back to raw PDF (vision):", err);
+
+    if (file.size > MAX_INLINE_PDF_BYTES) {
+      throw createNestedError(
+        `This PDF is ${(file.size / (1024 * 1024)).toFixed(1)}MB and couldn't be pre-processed, which is too large to send directly. Try a smaller file.`,
+        err
+      );
+    }
+
     const base64Data = await fileToBase64(file);
     content = [
       { inlineData: { mimeType: "application/pdf", data: base64Data } },
@@ -193,12 +336,30 @@ export async function parseCurriculumFromPDF(file) {
     ];
   }
 
-  const raw = await generateWithRetry(content);
+  const { text: raw, finishReason } = await generateWithRetry(content);
 
   try {
     return JSON.parse(raw);
   } catch (error) {
+    const repaired = attemptJSONRepair(raw);
+    if (repaired) {
+      console.warn(
+        "Gemini's response was truncated" +
+          (finishReason ? ` (finishReason: ${finishReason})` : "") +
+          " — recovered a partial curriculum from what was returned. Some modules/topics/lessons near the end may be missing."
+      );
+      return repaired;
+    }
+
     console.error("Gemini returned invalid JSON:", raw);
-    throw new Error("Gemini returned invalid curriculum JSON.", { cause: error });
+
+    if (finishReason === "MAX_TOKENS") {
+      throw createNestedError(
+        "The document was too long to process in one pass and the response got cut off. Try a shorter PDF, or split this one into smaller sections.",
+        error
+      );
+    }
+
+    throw createNestedError("Gemini returned invalid curriculum JSON.", error);
   }
 }

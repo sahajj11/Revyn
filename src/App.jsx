@@ -170,9 +170,17 @@ function EditableDescription({ value, onChange, placeholder, className = "" }) {
     el.style.height = `${el.scrollHeight}px`;
   };
 
+  // Resize on every value change, not just while `editing` is true. A
+  // description that already has content (e.g. hydrated from an AI-parsed
+  // PDF) was previously stuck at its default single-line height until
+  // something happened to flip `editing` — which for a non-empty value
+  // never actually occurred, since there's no onFocus handler here. That
+  // made long text look clipped until you clicked in, tabbed away, and
+  // some other state change happened to trigger a resize. Now it's sized
+  // correctly from the first render, no interaction required.
   useEffect(() => {
-    if (editing) resize();
-  }, [editing, value]);
+    resize();
+  }, [value, editing]);
 
   if (!editing && !value) {
     return (
@@ -237,14 +245,14 @@ function Pill({ children }) {
 function RowActions({ onDuplicate, onDelete, ariaLabel }) {
   return (
     <div className="flex items-center gap-0.5 opacity-40 group-hover:opacity-100 transition-opacity shrink-0">
-      <button
+      {/* <button
         className="p-1.5 rounded-md cursor-grab active:cursor-grabbing hover:bg-black/5 hover:scale-110 transition-all"
         style={{ color: MUTED }}
         title="Reorder"
         tabIndex={-1}
       >
         <GripVertical size={14} />
-      </button>
+      </button> */}
       <button
         onClick={onDuplicate}
         className="p-1.5 rounded-md cursor-pointer hover:bg-black/5 hover:scale-110 transition-all"
@@ -369,8 +377,112 @@ const PARSE_STAGES = [
   "Generating your curriculum",
 ];
 
+// One set of lines, reused across every stage — they don't swap between
+// "raw" and "structured" layers, they physically move, resize, and
+// recolor into place. Stage 0 they're an ordinary paragraph; by stage 3
+// the same six lines have become a module bar, two topic bars, and three
+// lesson bars. The tree isn't decoration standing in for the transform —
+// it IS the transform.
+const SKELETON_LINES = [
+  { role: "module", rawWidth: "94%" },
+  { role: "topic", rawWidth: "78%" },
+  { role: "topic", rawWidth: "85%" },
+  { role: "lesson", rawWidth: "65%" },
+  { role: "lesson", rawWidth: "72%" },
+  { role: "lesson", rawWidth: "58%" },
+];
+
+const RAW_LINE_COLOR = "#DCDCE3";
+
+function getLineStyle(role, roleIndex, rawY, rawWidth, stage) {
+  if (stage <= 0) {
+    return { x: 0, y: rawY, width: rawWidth, height: 6, radius: 3, color: RAW_LINE_COLOR, opacity: 1 };
+  }
+
+  if (role === "module") {
+    return { x: 0, y: 0, width: "100%", height: 8, radius: 4, color: INK, opacity: 1 };
+  }
+
+  if (role === "topic") {
+    if (stage < 2) {
+      return { x: 0, y: rawY, width: rawWidth, height: 6, radius: 3, color: RAW_LINE_COLOR, opacity: 0.35 };
+    }
+    return {
+      x: 24,
+      y: 20 + roleIndex * 12,
+      width: roleIndex === 0 ? "46%" : "38%",
+      height: 6,
+      radius: 3,
+      color: INK_SOFT,
+      opacity: 1,
+    };
+  }
+
+  // role === "lesson"
+  if (stage < 3) {
+    return { x: 0, y: rawY, width: rawWidth, height: 6, radius: 3, color: RAW_LINE_COLOR, opacity: 0.35 };
+  }
+  return {
+    x: 48,
+    y: 54 + roleIndex * 12,
+    width: ["62%", "48%", "70%"][roleIndex],
+    height: 4,
+    radius: 4,
+    color: LESSON_COLORS[roleIndex % LESSON_COLORS.length],
+    opacity: 1,
+  };
+}
+
+// isWaiting: true only during the creep phase (final stage reached, but the
+// real API call hasn't resolved yet). Bars that are already "locked into
+// place" get a slow, staggered breathing pulse during this window instead
+// of sitting dead-still — so the tree visually keeps pace with the
+// progress bar's continued creep instead of finishing early and going
+// static while the number underneath it is still climbing.
+function CurriculumSkeleton({ stage, isWaiting }) {
+  let topicCounter = 0;
+  let lessonCounter = 0;
+
+  return (
+    <div className="relative" style={{ height: 92 }}>
+      {SKELETON_LINES.map((line, i) => {
+        const roleIndex =
+          line.role === "topic" ? topicCounter++ : line.role === "lesson" ? lessonCounter++ : 0;
+        const rawY = i * 15;
+        const s = getLineStyle(line.role, roleIndex, rawY, line.rawWidth, stage);
+        const isLocked = stage >= (line.role === "module" ? 1 : line.role === "topic" ? 2 : 3);
+
+        return (
+          <div
+            key={i}
+            className={`absolute top-0 left-0 ${stage <= 0 ? "animate-shimmer" : ""} ${
+              isWaiting && isLocked ? "animate-line-pulse" : ""
+            }`}
+            style={{
+              height: s.height,
+              width: s.width,
+              borderRadius: s.radius,
+              backgroundColor: s.color,
+              opacity: s.opacity,
+              transform: `translate(${s.x}px, ${s.y}px)`,
+              transitionProperty: "transform, width, background-color, opacity",
+              transitionDuration: "0.55s",
+              transitionTimingFunction: "cubic-bezier(0.16, 1, 0.3, 1)",
+              transitionDelay: `${i * 45}ms`,
+              animationDelay: isWaiting && isLocked ? `${i * 180}ms` : undefined,
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+const CREEP_CEILING = 90;
+
 function ParsingModal({ fileName, fixedStageIndex }) {
   const [activeStage, setActiveStage] = useState(0);
+  const [creepPct, setCreepPct] = useState(0);
 
   useEffect(() => {
     if (activeStage >= PARSE_STAGES.length - 1) return;
@@ -378,68 +490,105 @@ function ParsingModal({ fileName, fixedStageIndex }) {
     return () => clearTimeout(t);
   }, [activeStage]);
 
-  const currentStage =
-    fixedStageIndex !== undefined ? fixedStageIndex : activeStage;
+  const currentStage = fixedStageIndex !== undefined ? fixedStageIndex : activeStage;
+  const isComplete = currentStage >= PARSE_STAGES.length;
+  const isOnFinalStage = !isComplete && currentStage === PARSE_STAGES.length - 1;
+  const skeletonStage = Math.min(currentStage, PARSE_STAGES.length - 1);
+
+  useEffect(() => {
+    if (!isOnFinalStage) return;
+
+    const interval = setInterval(() => {
+      setCreepPct((prev) => {
+        const remaining = CREEP_CEILING - prev;
+        if (remaining < 0.3) return prev;
+        return prev + remaining * 0.06;
+      });
+    }, 250);
+
+    return () => clearInterval(interval);
+  }, [isOnFinalStage]);
+
+  const stageLabel = isComplete ? "Curriculum ready" : PARSE_STAGES[currentStage];
+  const baseStagePct = (currentStage / PARSE_STAGES.length) * 100;
+
+  const displayPct = isComplete
+    ? 100
+    : isOnFinalStage
+    ? baseStagePct + (creepPct / 100) * (100 - baseStagePct)
+    : baseStagePct;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#15161A]/45 backdrop-blur-sm px-4">
+      <style>{`
+        @keyframes linePulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.45; }
+        }
+        .animate-line-pulse {
+          animation: linePulse 1.6s ease-in-out infinite;
+        }
+      `}</style>
+
       <div
         className="animate-modal-in rounded-2xl shadow-2xl w-full max-w-sm p-7"
         style={{ backgroundColor: "#FFFFFF", border: `1px solid ${HAIRLINE}` }}
       >
-        <div className="flex items-center justify-center mb-4">
-          <div
-            className="w-12 h-12 rounded-full flex items-center justify-center animate-pulse"
-            style={{ backgroundColor: ACCENT_TINT }}
-          >
-            <Sparkles size={22} style={{ color: ACCENT }} />
-          </div>
+        <div className="flex items-center justify-center gap-1.5 mb-1">
+          {isComplete ? (
+            <Check size={14} style={{ color: ACCENT }} />
+          ) : (
+            <Sparkles size={14} style={{ color: ACCENT }} className={isOnFinalStage ? "animate-pulse" : ""} />
+          )}
+          <h3 className="font-ui text-center text-base font-bold" style={{ color: INK }}>
+            Generating your curriculum
+          </h3>
         </div>
-
-        <h3 className="font-ui text-center text-base font-bold mb-1" style={{ color: INK }}>
-          Generating your curriculum
-        </h3>
         {fileName && (
-          <p className="font-ui text-center text-xs mb-6 truncate" style={{ color: MUTED }}>
+          <p className="font-ui text-center text-xs mb-5 truncate" style={{ color: MUTED }}>
             {fileName}
           </p>
         )}
 
-        <div className="space-y-3">
-          {PARSE_STAGES.map((stage, i) => {
-            const isDone = i < currentStage;
-            const isActive = i === currentStage;
-            return (
-              <div key={stage} className="flex items-center gap-3">
-                <div
-                  className="w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition-colors border"
-                  style={{
-                    backgroundColor: isDone ? ACCENT : "transparent",
-                    borderColor: isDone ? ACCENT : isActive ? ACCENT : HAIRLINE,
-                  }}
-                >
-                  {isDone && <Check size={12} className="text-white" />}
-                  {isActive && !isDone && (
-                    <div className="w-2 h-2 rounded-full animate-pulse" style={{ backgroundColor: ACCENT }} />
-                  )}
-                </div>
-                <span
-                  className={`font-ui text-sm transition-colors ${isActive ? "animate-shimmer" : ""}`}
-                  style={{
-                    color: isDone ? MUTED : isActive ? INK : "#C9C9D3",
-                    textDecoration: isDone ? "line-through" : "none",
-                    fontWeight: isActive ? 500 : 400,
-                  }}
-                >
-                  {stage}
-                </span>
-              </div>
-            );
-          })}
+        <div
+          className="rounded-xl mb-5"
+          style={{ backgroundColor: PAPER, border: `1px solid ${HAIRLINE}`, padding: "14px 14px 16px" }}
+        >
+          <CurriculumSkeleton stage={skeletonStage} isWaiting={isOnFinalStage} />
         </div>
 
-        <p className="font-ui text-center text-[11px] mt-6" style={{ color: "#B7B7C2" }}>
-          This can take a moment for longer documents
+        <div className="flex items-center justify-between mb-1.5">
+          <span key={stageLabel} className="font-ui text-[13px] font-semibold animate-row-in" style={{ color: INK }}>
+            {stageLabel}
+          </span>
+          <span className="font-ui text-[11px] font-medium tabular-nums" style={{ color: MUTED }}>
+            {Math.round(displayPct)}%
+          </span>
+        </div>
+
+        <div className="h-[5px] rounded-full overflow-hidden relative" style={{ backgroundColor: HAIRLINE }}>
+          <div
+            className="h-full rounded-full"
+            style={{
+              width: `${displayPct}%`,
+              backgroundColor: ACCENT,
+              transition: isOnFinalStage ? "width 0.25s linear" : "width 0.6s cubic-bezier(0.16, 1, 0.3, 1)",
+            }}
+          />
+          {isOnFinalStage && (
+            <div
+              className="absolute top-0 h-full w-8 opacity-40"
+              style={{
+                left: `${Math.max(displayPct - 8, 0)}%`,
+                background: `linear-gradient(90deg, transparent, ${ACCENT}, transparent)`,
+                transition: "left 0.25s linear",
+              }}
+            />
+          )}
+        </div>
+
+        <p className="font-ui text-center text-[11px] mt-5" style={{ color: "#B7B7C2" }}>
+          {isOnFinalStage ? "Almost there — finalizing details" : "This can take a moment for longer documents"}
         </p>
       </div>
     </div>
